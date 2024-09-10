@@ -1,0 +1,920 @@
+---
+title: "Housing dataset"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Set up libraries
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyr)
+library(zoo)
+library(readxl)
+library(stats)
+library(readr) 
+library(ggplot2)
+library(sf)
+library(tmap)
+library(sp)
+library(spdep)
+library(MASS)
+library(tidyverse)
+library(stringr)
+library(data.table)
+```
+
+```{r}
+# Set up working directory and load files
+
+setwd("C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data")
+
+# Load datasets
+house_prices <- read_csv('C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/House prices.csv')
+accomodation_2011 <- read_csv('C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/housing 2011.csv')
+accomodation_2021 <- read_csv('C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/housing 2021.csv')
+tenure_2001 <- read_csv('C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/home tenure 2001.csv')
+tenure_2011 <- read_csv('C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/home tenure 2011.csv')
+tenure_2021 <- read_csv('C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/home tenure 2021.csv')
+private_rents <- read_csv('C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/private rents.csv')
+affordable_budget <- read_csv('C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/affordable budget.csv')
+
+# Spatial data
+msoa <- st_read("C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/MSOA_2011_London_gen_MHW.shp")
+lsoa <- st_read("C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/LSOA_2011_London_gen_MHW.shp")
+borough <- st_read("C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Data/London_Borough_Excluding_MHW.shp")
+```
+
+```{r}
+# Preprocess Housing price
+
+# Rename columns to keep only the last year in the range
+colnames(house_prices) <- gsub("Year ending (Dec|Mar|Jun|Sep) ", "", colnames(house_prices))
+colnames(house_prices)[colnames(house_prices) == "Local authority code"] <- "LAD11CD"
+colnames(house_prices)[colnames(house_prices) == "Local authority name"] <- "LAD11NM"
+
+# Eliminate all columns before 2001
+years_to_keep <- as.character(seq(2001, 2021, by = 2))
+columns_to_keep <- c("LAD11CD", "LAD11NM", years_to_keep)
+house_prices <- house_prices %>%
+  dplyr::select(all_of(columns_to_keep))
+
+# Make all values integers
+house_prices[ , 3:ncol(house_prices)] <- lapply(house_prices[ , 3:ncol(house_prices)], function(x) as.integer(gsub(",", "", x)))
+
+# Calculate at MSOA level
+msoa_houseprice <- msoa %>%
+  left_join(house_prices, by = "LAD11NM")
+
+# Select relevant columns
+msoa_houseprice <- msoa_houseprice %>%
+  dplyr::select(MSOA11CD, MSOA11NM, all_of(years_to_keep), geometry)
+
+# Print the resulting dataframe to check
+print(msoa_houseprice)
+
+# Convert the geometry column to an sf object
+msoa_houseprice <- st_as_sf(msoa_houseprice, crs = 27700)
+
+#Calculate average msoa houseprice
+average_houseprice <- msoa_houseprice %>%
+  dplyr::select(-geometry) %>%  # Exclude the geometry column
+  group_by(MSOA11CD, MSOA11NM) %>%
+  summarise(across(starts_with("20"), ~ mean(.x, na.rm = TRUE), .names = "avg_{.col}")) %>%
+  ungroup()
+
+long_format_houseprice <- average_houseprice %>%
+  pivot_longer(
+    cols = starts_with("avg_"),   # Pivot columns that start with "avg_"
+    names_to = "Year",            # New column name for the years
+    values_to = "Houseprice"      # New column name for the house prices
+  )
+
+# Remove the "avg_" prefix from the Year column
+long_format_houseprice <- long_format_houseprice %>%
+  mutate(Year = gsub("avg_", "", Year))
+
+# Convert the Year column to numeric if needed
+long_format_houseprice <- long_format_houseprice %>%
+  mutate(Year = as.numeric(Year))
+```
+
+```{r}
+# Preprocess Accommodation
+
+# Accommodation 2011
+
+# Select columns 'Area' and 'Overcrowded ( -1 or less)' from 'house_2011'
+accomodation_2011 <- accomodation_2011[, c('Area', 'Overcrowded ( -1 or less)')]
+
+# Calculate total population per borough
+msoa <- msoa %>%
+  group_by(LAD11NM) %>%
+  mutate(TotalPopulation = sum(USUALRES))
+
+# Calculate the proportion for each MSOA
+msoa <- msoa %>%
+  mutate(Proportion = USUALRES / TotalPopulation)
+
+# Merge accommodation2011 data with MSOA data
+msoa_accomodation_2011 <- merge(msoa, accomodation_2011, by.x = "LAD11NM", by.y = "Area")
+
+# Calculate distributed data
+msoa_accomodation_2011 <- msoa_accomodation_2011 %>%
+  mutate(DistributedOvercrowded = Proportion * `Overcrowded ( -1 or less)`)
+
+# Select final columns
+final_accomodation_2011 <- msoa_accomodation_2011 %>%
+  dplyr::select(MSOA11NM, MSOA11CD, geometry, DistributedOvercrowded)
+
+final_accomodation_2011 <- final_accomodation_2011 %>%
+  rename(
+    occupation_2011 = DistributedOvercrowded
+  )
+
+# Accommodation 2021
+
+# Selecting columns for accommodation_2021 dataframe
+accomodation_2021 <- accomodation_2021[, c('Lower layer Super Output Areas Code',
+                             'Lower layer Super Output Areas',
+                             'Occupancy rating for bedrooms (5 categories)', 'Observation')]
+
+# Check the structure of the dataframe to ensure column names are correct
+str(accomodation_2021)
+
+# Filter the rows with occupancy rating of bedrooms: "-1 or less"
+clean_accomodation_2021 <- accomodation_2021 %>%
+  group_by(`Lower layer Super Output Areas Code`) %>%
+  filter(row_number() %in% 33:40) %>%
+  ungroup()
+
+# Summarize the total values for each "Lower layer Super Output Areas Code"
+aggregated_accomodation_2021 <- clean_accomodation_2021 %>%
+  group_by(`Lower layer Super Output Areas Code`, `Lower layer Super Output Areas`, `Occupancy rating for bedrooms (5 categories)`) %>%
+  summarise(Total_Observations = sum(Observation, na.rm = TRUE)) %>%
+  ungroup()
+
+# Merge to the LSOA codes
+merged_accomodation_2021 <- merge(aggregated_accomodation_2021, lsoa, by.x = "Lower layer Super Output Areas Code", by.y = "LSOA11CD")
+
+# Aggregate at MSOA level
+agg_accomodation_2021 <- merged_accomodation_2021 %>%
+  group_by(MSOA11CD, MSOA11NM) %>%
+  summarise(
+    Total_Observations = sum(Total_Observations),
+    USUALRES = sum(USUALRES),
+    HHOLDRES = sum(HHOLDRES),
+    COMESTRES = sum(COMESTRES),
+    POPDEN = mean(POPDEN),
+    HHOLDS = sum(HHOLDS),
+    AVHHOLDSZ = mean(AVHHOLDSZ)
+  )
+
+# Select final columns
+final_accomodation_2021 <- agg_accomodation_2021 %>%
+  dplyr::select(MSOA11NM, MSOA11CD, 'Total_Observations')
+
+# Merge to the MSOA codes
+ffinal_accomodation_2021 <- merge(final_accomodation_2021, msoa, by = "MSOA11NM")
+
+# Select final columns
+fffinal_accomodation_2021 <- ffinal_accomodation_2021 %>%
+  dplyr::select(MSOA11NM, MSOA11CD.x, 'Total_Observations', geometry)
+
+fffinal_accomodation_2021 <- fffinal_accomodation_2021 %>%
+  rename(
+    occupation_2021 = 'Total_Observations'
+  )
+
+# Total accommodation dataset
+
+# Join both datasets
+accommodation <- final_accomodation_2011 %>%
+  inner_join(fffinal_accomodation_2021, by = c("MSOA11NM", "MSOA11CD" = "MSOA11CD.x", "geometry"))
+
+# Interpolate missing years
+# Convert the geometry column to an sf object
+accommodation <- st_as_sf(accommodation, crs = 27700)
+
+# Reshape the data for easier interpolation
+accommodation_long <- accommodation %>%
+  pivot_longer(
+    cols = c(occupation_2011, occupation_2021), 
+    names_to = "Year", 
+    names_prefix = "occupation_", 
+    values_to = "Occupation"
+  ) %>%
+  mutate(Year = as.numeric(Year))
+
+# Define years to interpolate
+years <- seq(2001, 2021, by = 2)
+
+# Perform interpolation for each MSOA
+interpolated_accommodation <- accommodation_long %>%
+  group_by(MSOA11NM, MSOA11CD, geometry) %>%
+  do({
+    data.frame(Year = years,
+               Occupation = approx(.$Year, .$Occupation, xout = years, rule = 2)$y)
+  }) %>%
+  ungroup() %>%
+  st_as_sf()
+```
+
+```{r}
+# Preprocess Tenure data
+
+# Calculate proportions 2001
+tenure_2001 <- tenure_2001 %>%
+  mutate(`2001 Owned` = `Tenure: Owned: Total; measures: Value` / `Tenure: All categories: Tenure; measures: Value`,
+         `2001 Rented` = `Tenure: Private rented: Total; measures: Value` / `Tenure: All categories: Tenure; measures: Value`,
+         `2001 Social` = `Tenure: Social rented: Total; measures: Value` / `Tenure: All categories: Tenure; measures: Value`)
+
+# Keep only the required columns 2001
+tenure_2001 <- tenure_2001 %>%
+  dplyr::select(`geography code`, `2001 Owned`, `2001 Rented`, `2001 Social`)
+
+# Ensure columns are numeric 2011
+tenure_2011 <- tenure_2011 %>%
+  mutate(
+    `Owned outright` = as.numeric(`Owned outright`),
+    `Owned with a mortgage or loan` = as.numeric(`Owned with a mortgage or loan`),
+    `Shared ownership` = as.numeric(`Shared ownership`),
+    `Rented from Local Authority` = as.numeric(`Rented from Local Authority`),
+    `Other social rented` = as.numeric(`Other social rented`),
+    `Private landlord or letting agency` = as.numeric(`Private landlord or letting agency`),
+    `Other private rented` = as.numeric(`Other private rented`),
+    `All Households` = as.numeric(`All Households`)
+  )
+
+# Perform the mutate operations
+tenure_2011 <- tenure_2011 %>%
+  mutate(
+    `2011 Owned` = (`Owned outright` + `Owned with a mortgage or loan` + `Shared ownership`) / `All Households`,
+    `2011 Social` = (`Rented from Local Authority` + `Other social rented`) / `All Households`,
+    `2011 Rented` = (`Private landlord or letting agency` + `Other private rented`) / `All Households`
+  )
+
+# Keep only the required columns 2011
+tenure_2011 <- tenure_2011 %>%
+  dplyr::select(`LSOA code`, `2011 Owned`, `2011 Rented`, `2011 Social`)
+
+# Ensure columns are numeric 2021
+tenure_2021 <- tenure_2021 %>%
+  mutate(
+    `Owned outright` = as.numeric(`Owned outright`),
+    `Owned with a mortgage or loan` = as.numeric(`Owned with a mortgage or loan`),
+    `Shared ownership` = as.numeric(`Shared ownership`),
+    `Rented from Local Authority` = as.numeric(`Rented from Local Authority`),
+    `Other social rented` = as.numeric(`Other social rented`),
+    `Private landlord or letting agency` = as.numeric(`Private landlord or letting agency`),
+    `Other private rented` = as.numeric(`Other private rented`),
+    `All Households` = as.numeric(`All Households`)
+  )
+
+# Perform the mutate operations
+tenure_2021 <- tenure_2021 %>%
+  mutate(
+    `2021 Owned` = (`Owned outright` + `Owned with a mortgage or loan` + `Shared ownership`) / `All Households`,
+    `2021 Social` = (`Rented from Local Authority` + `Other social rented`) / `All Households`,
+    `2021 Rented` = (`Private landlord or letting agency` + `Other private rented`) / `All Households`
+  )
+
+# Keep only the required columns 2021
+tenure_2021 <- tenure_2021 %>%
+  dplyr::select(`LSOA code`, `2021 Owned`, `2021 Rented`, `2021 Social`)
+
+
+# Join the datasets
+tenure_2001 <- tenure_2001 %>%
+  rename('LSOA code' = `geography code`)
+tenure_2001 <- tenure_2001 %>%
+  mutate(`LSOA code` = as.character(`LSOA code`))
+tenure_2011 <- tenure_2011 %>%
+  mutate(`LSOA code` = as.character(`LSOA code`))
+tenure_2021 <- tenure_2021 %>%
+  mutate(`LSOA code` = as.character(`LSOA code`))
+joined_tenure <- tenure_2001 %>%
+  full_join(tenure_2011, by = "LSOA code") %>%
+  full_join(tenure_2021, by = "LSOA code")
+cleaned_joined_tenure <- joined_tenure %>%
+  drop_na()
+
+# Interpolate missing years
+years <- seq(2001, 2021, by = 2)
+# Process the data
+interpolated_tenure <- cleaned_joined_tenure %>%
+  pivot_longer(cols = -`LSOA code`, names_to = "variable", values_to = "value") %>%
+  separate(variable, into = c("year", "category"), sep = " ") %>%
+  mutate(year = as.numeric(year)) %>%
+  complete(`LSOA code`, category, year = years) %>%
+  group_by(`LSOA code`, category) %>%
+  arrange(year) %>%
+  mutate(value = zoo::na.approx(value, maxgap = Inf, na.rm = FALSE)) 
+
+# Calculate at msoa level
+lsoa_tenure <- lsoa %>%
+  left_join(interpolated_tenure, by = c("LSOA11CD" = "LSOA code"))
+# Select the required columns
+selected_tenure <- lsoa_tenure %>%
+  dplyr::select(MSOA11CD, category, year, value)
+
+wide_tenure <- selected_tenure %>%
+  pivot_wider(names_from = category,
+values_from = value)
+
+# get unique msoa values
+library(dplyr)
+# Grouping by MSOA and year, then calculating average tenure (Owned, Rented, Social)
+grouped_data <- wide_tenure %>%
+  group_by(MSOA11CD, year) %>%
+  summarise(
+    average_owned = mean(Owned, na.rm = TRUE),
+    average_rented = mean(Rented, na.rm = TRUE),
+    average_social = mean(Social, na.rm = TRUE)
+  )
+
+```
+
+```{r}
+#Preprocess budget data
+
+# Clean empty row
+affordable_budget <- affordable_budget %>%
+  filter(row_number() != 1)
+
+# Eliminate columns 
+affordable_budget <- affordable_budget %>%
+  dplyr::select(-1, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -34, -35)
+
+# Rename the first column
+colnames(affordable_budget)[1] <- "LAD11CD"
+
+# Extract column names
+col_names <- colnames(affordable_budget)
+# Modify column names to keep only the last two digits for the time range columns
+new_col_names <- sapply(col_names, function(x) {
+  if (grepl("^[0-9]{4}-[0-9]{2}$", x)) {
+    return(str_sub(x, -2))
+  } else {
+    return(x)
+  }
+})
+# Assign new column names to the data frame
+colnames(affordable_budget) <- new_col_names
+# Extract column names
+col_names <- colnames(affordable_budget)
+# Modify column names to start with "20" for the time range columns
+new_col_names <- sapply(col_names, function(x) {
+  if (grepl("^[0-9]{2}$", x)) {
+    return(paste0("20", x))
+  } else {
+    return(x)
+  }
+})
+# Assign new column names to the data frame
+colnames(affordable_budget) <- new_col_names
+
+# Convert to long format
+budget_long <- affordable_budget %>%
+  pivot_longer(
+    cols = starts_with("20"), # Select all columns that start with "20"
+    names_to = "Year",        # Name for the new "Year" column
+    values_to = "Budget"      # Name for the new "Budget" column
+  )
+
+# Filter out rows where the year is even
+budget_filtered <- budget_long %>%
+  filter(as.integer(Year) %% 2 != 0)
+
+# Join the data frames by LAD11CD
+budget_msoa <- budget_filtered %>%
+  inner_join(msoa, by = "LAD11CD")
+
+# Create a new budget column by multiplying the budget by the proportion
+budget_msoa <- budget_msoa %>%
+  mutate(DisaggregatedBudget = Budget * Proportion)
+
+# Select the desired columns
+final_budget <- budget_msoa %>%
+  dplyr::select(MSOA11CD, MSOA11NM, geometry, Year, DisaggregatedBudget)
+```
+
+```{r}
+# Preprocess rent prices
+
+# Clean empty row
+private_rents <- private_rents %>%
+  filter(row_number() != 1)
+
+# Eliminate columns 
+private_rents <- private_rents %>%
+  dplyr::select(-1, -3, -4, -5, -6, -7, -29, -30)
+
+# Rename the first column
+colnames(private_rents)[1] <- "LAD11CD"
+
+# Extract column names
+col_names <- colnames(private_rents)
+# Modify column names to keep only the last two digits for the time range columns
+new_col_names <- sapply(col_names, function(x) {
+  if (grepl("^[0-9]{4}-[0-9]{2}$", x)) {
+    return(str_sub(x, -2))
+  } else {
+    return(x)
+  }
+})
+# Assign new column names to the data frame
+colnames(private_rents) <- new_col_names
+# Extract column names
+col_names <- colnames(private_rents)
+# Modify column names to start with "20" for the time range columns
+new_col_names <- sapply(col_names, function(x) {
+  if (grepl("^[0-9]{2}$", x)) {
+    return(paste0("20", x))
+  } else {
+    return(x)
+  }
+})
+# Assign new column names to the data frame
+colnames(private_rents) <- new_col_names
+colnames(private_rents)[19] <- "2018"
+colnames(private_rents)[20] <- "2019"
+
+# Convert to long format
+rents_long <- private_rents %>%
+  pivot_longer(
+    cols = starts_with("20"), # Select all columns that start with "20"
+    names_to = "Year",        # Name for the new "Year" column
+    values_to = "Rent"      # Name for the new "Budget" column
+  )
+
+# Filter out rows where the year is even
+rents_filtered <- rents_long %>%
+  filter(as.integer(Year) %% 2 != 0)
+
+# Join the data frames by LAD11CD
+rents_msoa <- rents_filtered %>%
+  inner_join(msoa, by = "LAD11CD")
+
+# Create a new budget column by multiplying the budget by the proportion
+rents_msoa <- rents_msoa %>%
+  mutate(Rent = as.integer(Rent), 
+         DisaggregatedRent = Rent * Proportion)
+
+# Select the desired columns
+final_rents <- rents_msoa %>%
+  dplyr::select(MSOA11CD, MSOA11NM, geometry, Year, DisaggregatedRent)
+```
+
+```{r}
+# Create final Housing dataset
+
+final_budget <- final_budget %>% dplyr::select(-geometry)
+final_rents <- final_rents %>% dplyr::select(-geometry)
+grouped_data <- grouped_data %>% dplyr::select(-geometry)
+interpolated_accommodation <- interpolated_accommodation %>% dplyr::select(-geometry)
+long_format_houseprice <- long_format_houseprice %>% dplyr::select(-geometry)
+
+final_budget <- final_budget %>%
+  mutate(Year = as.integer(Year))
+
+final_rents <- final_rents %>%
+  mutate(Year = as.integer(Year))
+
+interpolated_accommodation <- interpolated_accommodation %>%
+  mutate(Year = as.integer(Year))
+
+long_format_houseprice <- long_format_houseprice %>%
+  mutate(Year = as.integer(Year))
+
+grouped_data <- grouped_data %>%
+  mutate(year = as.integer(year))
+
+housing <- final_budget %>%
+  inner_join(final_rents, by = c("MSOA11CD", "Year", "MSOA11NM")) %>%
+  inner_join(interpolated_accommodation, by = c("MSOA11CD", "Year", "MSOA11NM")) %>%
+  inner_join(long_format_houseprice, by = c("MSOA11CD", "Year", "MSOA11NM"))
+
+library(dplyr)
+
+# Remove geometry.x and rename geometry.y to geometry
+housing_cleaned <- housing %>%
+  dplyr::select(-geometry.x) %>%
+  dplyr::rename(geometry = geometry.y)
+
+# Load the dplyr package
+library(dplyr)
+
+grouped_data <- grouped_data%>%
+  dplyr::rename(Year = year)
+
+final_housing <- housing_cleaned %>%
+  inner_join(grouped_data, by = c("MSOA11CD", "Year"))
+
+final_housing <- final_housing %>% dplyr::select(-"geometry.y")
+final_housing <- final_housing %>% rename("geometry" = "geometry.x")
+```
+
+## EDA of housing components
+```{r}
+str(final_housing$DisaggregatedRent)
+
+# Identify non-numeric entries
+non_numeric <- final_housing[!is.na(as.numeric(final_housing$DisaggregatedRent)) == FALSE, ]
+print(non_numeric)
+
+# Calculate summary statistics by Year, ignoring NA values
+housing_by_year <- final_housing %>%
+  group_by(Year) %>%
+  summarise(across(
+    where(is.numeric),
+    list(
+      mean = ~mean(.x, na.rm = TRUE),
+      sd = ~sd(.x, na.rm = TRUE),
+      min = ~min(.x, na.rm = TRUE),
+      max = ~max(.x, na.rm = TRUE)
+    )
+  ))
+
+# Calculate summary statistics by MSOA11CD, ignoring NA values
+housing_by_msoa <- final_housing %>%
+  group_by(MSOA11CD, geometry) %>%
+  summarise(across(
+    where(is.numeric),
+    list(
+      mean = ~mean(.x, na.rm = TRUE),
+      sd = ~sd(.x, na.rm = TRUE),
+      min = ~min(.x, na.rm = TRUE),
+      max = ~max(.x, na.rm = TRUE)
+    )
+  ))
+
+# Save the dataset as a CSV file
+write.csv(housing_by_year, "C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Code/housing by year.csv", row.names = FALSE)
+write.csv(housing_by_msoa, "C:/Users/USUARIO/Documents/UCL/Dissertation/v3 longitudinal diaspora study/Code/housing by msoa.csv", row.names = FALSE)
+```
+
+# Annual changes for each variable
+```{r}
+# List of variables to plot
+variables_to_plot <- c(
+    "DisaggregatedBudget_mean",
+    "DisaggregatedRent_mean",
+    "Occupation_mean",
+    "Houseprice_mean",
+    "average_owned_mean",
+    "average_rented_mean",
+    "average_social_mean"
+)
+
+# Loop through each variable to create individual plots
+for (var in variables_to_plot) {
+  p <- ggplot(housing_by_year, aes_string(x = "Year", y = var)) +
+    geom_line(color = "blue") +
+    geom_point(color = "red") +
+    labs(title = paste("Year vs", var),
+         x = "Year",
+         y = var) +
+    theme_minimal()
+  
+  # Save each plot as a PNG file
+  ggsave(filename = paste0(var, "housing_trend.png"), plot = p)}
+```
+
+# MSOA changes for each variable
+```{r}
+# List of variables to create thematic maps
+variables_to_plot <- c(
+    "DisaggregatedBudget_mean",
+    "DisaggregatedRent_mean",
+    "Occupation_mean",
+    "Houseprice_mean",
+    "average_owned_mean",
+    "average_rented_mean",
+    "average_social_mean"
+)
+
+housing_by_msoa <- st_as_sf(housing_by_msoa, crs = 27700)
+
+# Loop through each variable to create and save thematic maps
+for (var in variables_to_plot) {
+  p <- ggplot(housing_by_msoa) +
+    geom_sf(aes_string(fill = var)) +
+    scale_fill_viridis_c() +  # Using Viridis color scale
+    labs(title = paste("Thematic Map of", var),
+         fill = var) +
+    theme_minimal()
+  
+  # Save each map as a PNG file
+  ggsave(filename = paste0(var, "housing_map.png"), plot = p)
+  
+  # Print the plot to the R console
+  print(p)
+}
+```
+
+
+```{r}
+# Calculate Housing Index with PCA
+
+# Load necessary libraries
+library(dplyr)
+library(stats)
+
+# 1. Standardize the directions of the variables
+housing_data <- final_housing %>%
+  mutate(
+    DisaggregatedBudget = DisaggregatedBudget, # Keep as is (higher is better)
+    DisaggregatedRent = -DisaggregatedRent, # Reverse
+    Occupation = -Occupation,               # Reverse
+    Houseprice = -Houseprice,               # Reverse
+    average_owned = average_owned,            # Keep as is (higher is better)
+    average_rented = -average_rented,         # Reverse (if considered worse)
+    average_social = average_social          # Keep as is (higher is better)
+  ) %>%
+  dplyr::select(-c(MSOA11CD, MSOA11NM, Year, geometry))
+
+# 2. Check for infinite or missing values
+
+housing_data <- housing_data %>%
+  mutate(across(everything(), as.numeric))
+
+any(is.infinite(unlist(housing_data)))  # Returns TRUE if there are infinite values
+any(is.na(housing_data))       # Returns TRUE if there are missing values
+
+# Remove rows with missing values
+housing_data_clean <- housing_data %>% drop_na()
+
+# 3. Standardize the data
+housing_data_scaled <- scale(housing_data_clean)
+
+# 4. Perform PCA
+pca_result <- prcomp(housing_data_scaled, center = TRUE, scale. = TRUE)
+
+# 5. Calculate the Housing Index using the first principal component
+housing_index <- pca_result$x[,1]
+
+# 5. Add the Housing Index to the original data frame
+# Extract rows used for PCA
+valid_rows <- complete.cases(final_housing %>% dplyr::select(-c(MSOA11CD, MSOA11NM, Year, geometry)))
+ffinal_housing <- final_housing %>%
+  filter(valid_rows) %>%
+  mutate(HousingIndex = housing_index)
+
+# 6. Select the final desired columns
+ffinal_housing <- ffinal_housing %>%
+  dplyr::select(MSOA11CD, MSOA11NM, geometry, Year, HousingIndex)
+
+# Reverse the sign of the Housing Index
+ffinal_housing <- ffinal_housing %>%
+  mutate(HousingIndex = -HousingIndex)
+```
+
+## EDA
+
+```{r}
+# Housing Index throughout time
+
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(sf)
+
+# Assuming your dataset is named 'housing_data'
+# Convert your data to an sf object
+ffinal_housing_sf <- st_as_sf(ffinal_housing, crs = 27700)
+
+# 1. Maps for selected years
+years_to_map <- c(2001, 2005, 2011, 2015, 2021)
+
+for (year in years_to_map) {
+  housing_year <- ffinal_housing_sf %>% filter(Year == year)
+  print(
+    ggplot(data = housing_year) +
+      geom_sf(aes(fill = HousingIndex)) +
+      scale_fill_viridis_c() +
+      ggtitle(paste("Housing Index in", year)) +
+      theme_minimal() +
+      labs(fill = "Housing Index") +
+      theme(legend.position = "right") +
+      theme(axis.text = element_blank(), axis.ticks = element_blank())
+  )
+}
+```
+
+```{r}
+# Map of average Housing Index
+average_housing <- ffinal_housing_sf %>%
+  group_by(MSOA11CD) %>%
+  summarise(AvgHousingIndex = mean(HousingIndex, na.rm = TRUE))
+
+ggplot(data = average_housing) +
+  geom_sf(aes(fill = AvgHousingIndex)) +
+  scale_fill_viridis_c() +
+  ggtitle("Average Housing Index") +
+  theme_minimal() +
+  labs(fill = "Avg Housing Index") +
+  theme(legend.position = "right") +
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+```
+
+```{r}
+# Trend in changes of HI for MSOAs
+
+library(dplyr)
+library(sf)
+library(ggplot2)
+
+# Determine the trend (increase, decrease, same) for each MSOA
+housing_trends <- ffinal_housing_sf %>%
+  group_by(MSOA11CD) %>%
+  summarise(
+    Start = min(HousingIndex, na.rm = TRUE),
+    End = max(HousingIndex, na.rm = TRUE)
+  ) %>%
+  mutate(Trend = case_when(
+    End > Start ~ "Increased",
+    End < Start ~ "Decreased",
+    End == Start ~ "Same"
+  ))
+
+# Ensure the MSOA11CD column is unique in housing_trends
+housing_trends <- housing_trends %>%
+  distinct(MSOA11CD, .keep_all = TRUE)
+
+# Plotting the trend
+ggplot(housing_trends) +
+  geom_sf(aes(fill = Trend)) +
+  scale_fill_manual(values = c("Increased" = "green", "Decreased" = "red", "Same" = "gray")) +
+  ggtitle("MSOA Trends in Housing Index") +
+  theme_minimal() +
+  labs(fill = "Trend") +
+  theme(legend.position = "right") +
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+```
+
+## Download CSV
+```{r}
+# Remove the geometry column from the data frame
+ffinal_housing_no_geo <- as.data.frame(ffinal_housing)
+ffinal_housing_no_geo$geometry <- NULL
+
+
+# Write the cleaned data frame to a CSV file
+write.csv(ffinal_housing_no_geo, "ffinal_housing_cleaned.csv", row.names = FALSE)
+```
+
+```{r}
+install.packages("spdep")
+library(spdep)
+```
+
+```{r}
+# Ensure the data is in sf format
+ffinal_housing <- st_as_sf(ffinal_housing)
+
+# Check and set the coordinate reference system (CRS) if needed
+ffinal_housing <- st_transform(ffinal_housing, crs = 27700)  
+```
+
+## Local Moran I's
+```{r}
+# Check and fix geometries if necessary
+ffinal_housing <- st_make_valid(ffinal_housing)
+```
+
+```{r}
+# Create the neighbors list
+neighbors <- poly2nb(ffinal_housing)
+
+# Identify polygons with no neighbors
+no_neighbors <- which(sapply(neighbors, length) == 0)
+
+# Print the MSOA11CDs of polygons with no neighbors
+print(ffinal_housing$MSOA11CD[no_neighbors])
+```
+
+```{r}
+valid_geometries <- st_is_valid(ffinal_housing)
+print(sum(!valid_geometries))
+```
+
+```{r}
+library(spdep)
+library(sf)
+library(ggplot2)
+library(dplyr)
+
+# List of variables to analyze
+variables <- c(
+  "HousingIndex"
+)
+
+# Unique years in the dataset
+years <- unique(ffinal_housing$Year)
+
+# Loop through each year and calculate Moran's I for each variable
+for (year in years) {
+  
+  # Filter data for the specific year
+  data_year <- ffinal_housing %>% filter(Year == year)
+  
+  # Convert to sf object if needed
+  data_year_sf <- st_as_sf(data_year, crs = 27700)
+  
+  # Create the neighbors list and spatial weights matrix
+  nb <- poly2nb(data_year_sf)
+  listw <- nb2listw(nb, zero.policy = TRUE)
+  
+  for (var in variables) {
+    
+    # Calculate Local Moran's I
+    local_moran <- localmoran(data_year_sf[[var]], listw)
+    
+    # Add results to the spatial dataframe
+    data_year_sf[[paste0(var, "_local_moran_I")]] <- local_moran[,1]  # Moran's I statistic
+    data_year_sf[[paste0(var, "_local_moran_p")]] <- local_moran[,5]  # p-value
+    
+    # Identify clusters
+    data_year_sf[[paste0(var, "_cluster")]] <- NA
+    data_year_sf[[paste0(var, "_cluster")]][data_year_sf[[paste0(var, "_local_moran_I")]] > 0 & data_year_sf[[paste0(var, "_local_moran_p")]] < 0.05] <- "High-High"
+    data_year_sf[[paste0(var, "_cluster")]][data_year_sf[[paste0(var, "_local_moran_I")]] < 0 & data_year_sf[[paste0(var, "_local_moran_p")]] < 0.05] <- "Low-Low"
+    data_year_sf[[paste0(var, "_cluster")]][data_year_sf[[paste0(var, "_local_moran_I")]] > 0 & data_year_sf[[paste0(var, "_local_moran_p")]] >= 0.05] <- "Not Significant"
+    data_year_sf[[paste0(var, "_cluster")]][data_year_sf[[paste0(var, "_local_moran_I")]] < 0 & data_year_sf[[paste0(var, "_local_moran_p")]] >= 0.05] <- "Not Significant"
+    
+    # Plot the Local Moran's I values
+    p <- ggplot(data_year_sf) +
+      geom_sf(aes_string(fill = paste0(var, "_local_moran_I"))) +
+      scale_fill_viridis_c(option = "C") +
+      labs(title = paste("Local Moran's I for", var, "in", year),
+           fill = "Local Moran's I") +
+      theme_minimal()
+    
+    # Save the Moran's I map
+    ggsave(paste0(var, "_Local_Morans_I_Map_", year, ".png"), plot = p, width = 7, height = 7)
+    
+    # Plot the cluster map
+    p_cluster <- ggplot(data_year_sf) +
+      geom_sf(aes_string(fill = paste0(var, "_cluster"))) +
+      scale_fill_manual(values = c("High-High" = "red", "Low-Low" = "blue", "Not Significant" = "grey")) +
+      labs(title = paste("Local Moran's I Cluster Map for", var, "in", year),
+           fill = "Cluster Type") +
+      theme_minimal()
+    
+    # Save the cluster map
+    ggsave(paste0(var, "_Local_Morans_I_Cluster_Map_", year, ".png"), plot = p_cluster, width = 7, height = 7)
+    
+  }
+}
+
+```
+
+## Hotspot analysis
+```{r}
+library(spdep)
+library(sf)
+library(ggplot2)
+
+# Define a function for Hotspot Analysis
+calculate_hotspots <- function(data, variable) {
+  # Create spatial weights matrix based on contiguity (using queen's case)
+  nb <- poly2nb(data)
+  listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+  
+  # Calculate local G statistics and convert to numeric vector
+  gstat <- as.numeric(localG(data[[variable]], listw))
+  
+  # Add local G statistics to the spatial dataframe
+  data[[paste0(variable, "_hotspot")]] <- gstat
+  
+  return(data)
+}
+
+# Apply Hotspot Analysis for each variable and year
+for (year in c(2001, 2005, 2011, 2015, 2021)) {
+  for (var in c(  "HousingIndex")) {
+    
+    # Filter data for the specific year
+    data_year <- ffinal_housing %>% filter(Year == year)
+    
+    # Perform hotspot analysis
+    data_year_hotspot <- calculate_hotspots(data_year, var)
+    
+    # Plot the Hotspot Map
+    p_hotspot <- ggplot(data_year_hotspot) +
+      geom_sf(aes_string(fill = paste0(var, "_hotspot"))) +
+      scale_fill_viridis_c(option = "C") +
+      labs(title = paste("Hotspot Analysis for", var, "in", year),
+           fill = "Local G* Value") +
+      theme_minimal()
+    
+    # Save the Hotspot Map
+    ggsave(paste0(var, "_Hotspot_Map_", year, ".png"), plot = p_hotspot, width = 7, height = 7)
+  }
+}
+
+```
+
+
+
+
+
